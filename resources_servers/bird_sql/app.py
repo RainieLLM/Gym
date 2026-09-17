@@ -11,6 +11,7 @@ BIRD evaluator's rule).
 import asyncio
 import logging
 import re
+from collections import Counter
 from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
@@ -39,8 +40,11 @@ logger = logging.getLogger(__name__)
 class FailureCode(str, Enum):
     NONE = "none"
     NO_SQL_EXTRACTED = "no_sql_extracted"
+    RESULT_MISMATCH = "result_mismatch"
     EXECUTION_ERROR = "execution_error"
+    EXECUTION_TIMEOUT = "execution_timeout"
     GOLD_EXECUTION_ERROR = "gold_execution_error"
+    GOLD_EXECUTION_TIMEOUT = "gold_execution_timeout"
     UNKNOWN_ERROR = "unknown_error"
 
 
@@ -181,11 +185,17 @@ class BirdSqlResourcesServer(SimpleResourcesServer):
 
         if err == "gold_sql_error":
             failure_reason = FailureCode.GOLD_EXECUTION_ERROR
+        elif err == "gold_sql_timeout":
+            failure_reason = FailureCode.GOLD_EXECUTION_TIMEOUT
         elif err == "pred_sql_error":
             failure_reason = FailureCode.EXECUTION_ERROR
-        else:
+        elif err == "pred_sql_timeout":
+            failure_reason = FailureCode.EXECUTION_TIMEOUT
+        elif err is None:
             execution_match = match
-            failure_reason = FailureCode.NONE if match else FailureCode.EXECUTION_ERROR
+            failure_reason = FailureCode.NONE if match else FailureCode.RESULT_MISMATCH
+        else:
+            failure_reason = FailureCode.UNKNOWN_ERROR
 
         reward = 1.0 if execution_match else 0.0
 
@@ -214,6 +224,12 @@ class BirdSqlResourcesServer(SimpleResourcesServer):
                 "extracted_sql",
             )
         )
+        reasons = Counter(result.get("failure_reason") for task in tasks for result in task)
+        total = sum(reasons.values())
+        metrics["diagnostics/total"] = total
+        for code in FailureCode:
+            metrics[f"diagnostics/{code.value}"] = reasons[code.value]
+        metrics["diagnostics/unclassified"] = total - sum(reasons[code.value] for code in FailureCode)
         return metrics
 
     def get_key_metrics(self, agent_metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -224,6 +240,7 @@ class BirdSqlResourcesServer(SimpleResourcesServer):
 
         key.update(highest_k_metrics(agent_metrics, "pass@1[avg-of-{k}]", score_names=["accuracy"]))
         key.update(highest_k_metrics(agent_metrics, "pass@{k}", score_names=["accuracy"]))
+        key.update({name: value for name, value in agent_metrics.items() if name.startswith("diagnostics/")})
 
         for prefix in {k.split("/pass@")[0] for k in agent_metrics if "/pass@" in k and k[0].islower()}:
             key.update(highest_k_metrics(agent_metrics, f"{prefix}/pass@1[avg-of-{{k}}]", score_names=["accuracy"]))

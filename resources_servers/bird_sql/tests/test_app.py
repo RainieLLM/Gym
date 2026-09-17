@@ -24,6 +24,7 @@ from resources_servers.bird_sql.app import (
     extract_sql_from_response,
 )
 from resources_servers.bird_sql.eval_utils import (
+    SqlExecutionResult,
     execute_and_compare,
     execute_sqlite,
     execute_sqlite_async,
@@ -224,13 +225,13 @@ class TestResultSetsMatch:
 
 class TestExecuteSqlite:
     def test_returns_rows(self, tiny_db):
-        assert execute_sqlite(tiny_db, "SELECT x FROM t ORDER BY x") == [(1,), (2,), (3,)]
+        assert execute_sqlite(tiny_db, "SELECT x FROM t ORDER BY x") == SqlExecutionResult([(1,), (2,), (3,)])
 
-    def test_syntax_error_returns_none(self, tiny_db):
-        assert execute_sqlite(tiny_db, "SELEC BROKEN") is None
+    def test_syntax_error_returns_sql_error(self, tiny_db):
+        assert execute_sqlite(tiny_db, "SELEC BROKEN") == SqlExecutionResult(None, "sql_error")
 
-    def test_missing_table_returns_none(self, tiny_db):
-        assert execute_sqlite(tiny_db, "SELECT * FROM does_not_exist") is None
+    def test_missing_table_returns_sql_error(self, tiny_db):
+        assert execute_sqlite(tiny_db, "SELECT * FROM does_not_exist") == SqlExecutionResult(None, "sql_error")
 
 
 # ---------------------------------------------------------------------------
@@ -252,31 +253,35 @@ def _mock_execute_sqlite(monkeypatch, gold_result, pred_result):
 
 @pytest.mark.asyncio
 async def test_execute_sqlite_async_success(monkeypatch):
-    _mock_execute_sqlite(monkeypatch, gold_result=[(1,)], pred_result=[(1,)])
+    _mock_execute_sqlite(monkeypatch, gold_result=SqlExecutionResult([(1,)]), pred_result=SqlExecutionResult([(1,)]))
     sem = asyncio.Semaphore(4)
     rows = await execute_sqlite_async(Path("/x.sqlite"), "SELECT 1 -- PRED", sem, timeout_s=5)
-    assert rows == [(1,)]
+    assert rows == SqlExecutionResult([(1,)])
 
 
 @pytest.mark.asyncio
 async def test_execute_sqlite_async_timeout(monkeypatch):
-    """A slow execute trips the timeout path and returns None."""
+    """A slow execute has a timeout code, rather than a SQL error code."""
     import time
 
     def slow_execute(db_path, sql):
-        time.sleep(10)
-        return [(1,)]
+        time.sleep(0.1)
+        return SqlExecutionResult([(1,)])
 
     monkeypatch.setattr("resources_servers.bird_sql.eval_utils.execute_sqlite", slow_execute)
 
     sem = asyncio.Semaphore(4)
-    rows = await execute_sqlite_async(Path("/x.sqlite"), "SELECT 1", sem, timeout_s=0.05)
-    assert rows is None
+    rows = await execute_sqlite_async(Path("/x.sqlite"), "SELECT 1", sem, timeout_s=0.01)
+    assert rows == SqlExecutionResult(None, "timeout")
 
 
 @pytest.mark.asyncio
 async def test_execute_and_compare_match(monkeypatch):
-    _mock_execute_sqlite(monkeypatch, gold_result=[(1,), (2,)], pred_result=[(2,), (1,)])
+    _mock_execute_sqlite(
+        monkeypatch,
+        gold_result=SqlExecutionResult([(1,), (2,)]),
+        pred_result=SqlExecutionResult([(2,), (1,)]),
+    )
     sem = asyncio.Semaphore(4)
     match, gold, pred, err = await execute_and_compare(
         Path("/x.sqlite"), gold_sql="SELECT GOLD_SQL", pred_sql="SELECT 1", semaphore=sem, timeout_s=5
@@ -286,7 +291,7 @@ async def test_execute_and_compare_match(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_and_compare_pred_error(monkeypatch):
-    _mock_execute_sqlite(monkeypatch, gold_result=[(1,)], pred_result=None)
+    _mock_execute_sqlite(monkeypatch, SqlExecutionResult([(1,)]), SqlExecutionResult(None, "sql_error"))
     sem = asyncio.Semaphore(4)
     match, _gold, pred, err = await execute_and_compare(
         Path("/x.sqlite"), gold_sql="SELECT GOLD_SQL", pred_sql="BROKEN", semaphore=sem, timeout_s=5
@@ -296,12 +301,37 @@ async def test_execute_and_compare_pred_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_and_compare_gold_error(monkeypatch):
-    _mock_execute_sqlite(monkeypatch, gold_result=None, pred_result=[(1,)])
+    _mock_execute_sqlite(monkeypatch, SqlExecutionResult(None, "sql_error"), SqlExecutionResult([(1,)]))
     sem = asyncio.Semaphore(4)
     match, gold, pred, err = await execute_and_compare(
         Path("/x.sqlite"), gold_sql="SELECT GOLD_SQL", pred_sql="SELECT 1", semaphore=sem, timeout_s=5
     )
     assert match is False and err == "gold_sql_error" and gold is None and pred is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gold_sql", "pred_sql", "expected_error"),
+    [
+        ("SELECT GOLD_SQL", "SELECT SLOW_SQL", "pred_sql_timeout"),
+        ("SELECT SLOW_SQL", "SELECT GOLD_SQL", "gold_sql_timeout"),
+    ],
+)
+async def test_execute_and_compare_timeout_side(monkeypatch, gold_sql, pred_sql, expected_error):
+    import time
+
+    def fake_execute(db_path, sql):
+        if "SLOW_SQL" in sql:
+            time.sleep(0.1)
+        return SqlExecutionResult([(1,)])
+
+    monkeypatch.setattr("resources_servers.bird_sql.eval_utils.execute_sqlite", fake_execute)
+
+    match, gold, pred, err = await execute_and_compare(
+        Path("/x.sqlite"), gold_sql, pred_sql, asyncio.Semaphore(1), timeout_s=0.01
+    )
+    assert match is False and err == expected_error and pred is None
+    assert gold == ([(1,)] if expected_error == "pred_sql_timeout" else None)
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +400,7 @@ async def test_verify_mismatch_with_codeblock(server_with_mocked_dbs, monkeypatc
     assert resp.reward == 0.0
     assert resp.execution_match is False
     assert resp.had_codeblock is True
-    assert resp.failure_reason == FailureCode.EXECUTION_ERROR
+    assert resp.failure_reason == FailureCode.RESULT_MISMATCH
 
 
 @pytest.mark.asyncio
@@ -397,6 +427,43 @@ async def test_verify_gold_sql_error(server_with_mocked_dbs, monkeypatch):
     resp = await server_with_mocked_dbs.verify(body)
     assert resp.reward == 0.0
     assert resp.failure_reason == FailureCode.GOLD_EXECUTION_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_tag", "failure_code"),
+    [
+        ("pred_sql_timeout", FailureCode.EXECUTION_TIMEOUT),
+        ("gold_sql_timeout", FailureCode.GOLD_EXECUTION_TIMEOUT),
+    ],
+)
+async def test_verify_sql_timeout(server_with_mocked_dbs, monkeypatch, error_tag, failure_code):
+    async def fake(**_kw):
+        return False, None, None, error_tag
+
+    monkeypatch.setattr("resources_servers.bird_sql.app.execute_and_compare", fake)
+    resp = await server_with_mocked_dbs.verify(_make_verify_request("```sql\nSELECT 1\n```"))
+    assert resp.reward == 0.0
+    assert resp.execution_match is False
+    assert resp.failure_reason == failure_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gold_sql", "model_sql", "failure_code", "reward"),
+    [
+        ("SELECT 1", "SELECT 1", FailureCode.NONE, 1.0),
+        ("SELECT 1", "SELECT 2", FailureCode.RESULT_MISMATCH, 0.0),
+        ("SELECT 1", "SELEC BROKEN", FailureCode.EXECUTION_ERROR, 0.0),
+        ("SELEC BROKEN", "SELECT 1", FailureCode.GOLD_EXECUTION_ERROR, 0.0),
+    ],
+)
+async def test_verify_real_sql_result(server_with_mocked_dbs, tiny_db, gold_sql, model_sql, failure_code, reward):
+    body = _make_verify_request(f"```sql\n{model_sql}\n```", gt_sql=gold_sql)
+    resp = await server_with_mocked_dbs.verify(body)
+    assert resp.reward == reward
+    assert resp.failure_reason == failure_code
+    assert resp.execution_match is (reward == 1.0)
 
 
 @pytest.mark.asyncio
@@ -460,6 +527,26 @@ class TestComputeMetrics:
         metrics = server_with_mocked_dbs.compute_metrics(tasks)
         assert metrics["pass@1[avg-of-1]/accuracy"] == pytest.approx(0.0)
 
+    def test_diagnostics_keep_all_rollouts_in_the_denominator(self, server_with_mocked_dbs):
+        tasks = [
+            [
+                self._task_result(1.0) | {"failure_reason": "none"},
+                self._task_result(0.0) | {"failure_reason": FailureCode.RESULT_MISMATCH},
+            ],
+            [
+                self._task_result(0.0) | {"failure_reason": "execution_timeout"},
+                self._task_result(0.0),  # An older rollout without a diagnostic code.
+            ],
+        ]
+        metrics = server_with_mocked_dbs.compute_metrics(tasks)
+        assert metrics["pass@1[avg-of-2]/accuracy"] == pytest.approx(25.0)
+        assert metrics["diagnostics/total"] == 4
+        assert metrics["diagnostics/none"] == 1
+        assert metrics["diagnostics/result_mismatch"] == 1
+        assert metrics["diagnostics/execution_timeout"] == 1
+        assert metrics["diagnostics/execution_error"] == 0
+        assert metrics["diagnostics/unclassified"] == 1
+
     def test_get_key_metrics_filters(self, server_with_mocked_dbs):
         agent_metrics = {
             "pass@1[avg-of-4]/accuracy": 60.0,
@@ -467,6 +554,7 @@ class TestComputeMetrics:
             "mean/output_tokens": 4000,
             "simple/pass@1[avg-of-4]/accuracy": 70.0,
             "challenging/pass@1[avg-of-4]/accuracy": 40.0,
+            "diagnostics/result_mismatch": 3,
             "unrelated": 0,
         }
         key = server_with_mocked_dbs.get_key_metrics(agent_metrics)
@@ -475,6 +563,7 @@ class TestComputeMetrics:
         assert "mean/output_tokens" in key
         assert "simple/pass@1[avg-of-4]/accuracy" in key
         assert "challenging/pass@1[avg-of-4]/accuracy" in key
+        assert key["diagnostics/result_mismatch"] == 3
         assert "unrelated" not in key
 
 

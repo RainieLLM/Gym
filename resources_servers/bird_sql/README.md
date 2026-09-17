@@ -56,13 +56,40 @@ For a full BIRD dev run, see `benchmarks/birdbench/README.md`.
 
 ## Verification flow
 
-1. Extract SQL from the model output (last ` ```sql ... ``` ` code block, with
-   comments stripped and whitespace collapsed).
-2. Execute the predicted SQL against the per-`db_id` SQLite database.
-3. Execute the ground-truth SQL against the same database.
+1. Extract SQL from the last ` ```sql ... ``` ` code block. Keep comments and
+   internal line breaks so SQLite can read the query as written.
+2. Execute the reference SQL against the per-`db_id` SQLite database.
+3. If the reference query succeeds, execute the predicted SQL against that database.
 4. Compare result sets via unordered set equality.
 5. Return reward `1.0` on match, `0.0` otherwise (or on any extraction /
    execution error).
+
+### Result codes
+
+The `failure_reason` field explains the result of each verifier call.
+The binary reward stays the same for every case. SQL error text does not appear
+in the response.
+
+| Code | Meaning |
+| --- | --- |
+| `none` | Both queries ran and their result sets match. |
+| `no_sql_extracted` | The model response has no SQL code block. No query ran. |
+| `result_mismatch` | Both queries ran, but their result sets differ. |
+| `execution_error` | The predicted SQL caused a SQLite error. |
+| `execution_timeout` | The predicted SQL exceeded the time limit. |
+| `gold_execution_error` | The reference SQL caused a SQLite error. |
+| `gold_execution_timeout` | The reference SQL exceeded the time limit. |
+| `unknown_error` | The verifier could not classify another error. |
+
+The verifier runs the reference SQL first. If it fails, the predicted SQL does
+not run. `diagnostics/total` counts all rollouts in a metrics report.
+`diagnostics/<code>` counts each result code. The `none` code marks correct
+answers. `diagnostics/unclassified` counts older rollouts without a known code.
+The accuracy metrics keep their original denominator.
+
+For older results, `execution_error` also covered a result mismatch or a
+predicted SQL timeout. Those cases now have separate codes. The scores and the
+result-set comparison rule do not change.
 
 ## Input JSONL format
 
